@@ -1,0 +1,367 @@
+console.log('[NPRD] Auto-Scraper (Fix) Loaded');
+
+// --- CLEANUP ---
+['nprd-api-btn', 'nprd-web-btn', 'nprd-modal', 'releaseDate', 'nprd-style'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.remove();
+});
+
+// --- CONFIG ---
+const separator = "•";
+const positionSelector = ".main-nowPlayingWidget-nowPlaying:not(#upcomingSongDiv) .main-trackInfo-name";
+const CACHE_KEY = "spicetify-nprd-cache";
+const AUTO_SCRAPE_KEY = "spicetify-nprd-auto-scrape";
+
+// --- STATE MANAGEMENT ---
+let debounceTimer = null;
+let prefetchTimer = null;
+let isAutoScrapeOn = (localStorage.getItem(AUTO_SCRAPE_KEY) === 'true');
+
+// --- MENU REGISTRATION (The New Part) ---
+(async function registerMenu() {
+  // Wait for Spicetify Menu API to be ready
+  while (!Spicetify || !Spicetify.Menu) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  new Spicetify.Menu.Item(
+    "Enable Auto-Scrape (Proxy)",
+    isAutoScrapeOn,
+    (self) => {
+      isAutoScrapeOn = !isAutoScrapeOn;
+      localStorage.setItem(AUTO_SCRAPE_KEY, isAutoScrapeOn);
+      self.setState(isAutoScrapeOn);
+
+      // Visual feedback on the Globe button
+      const globeBtn = document.getElementById("nprd-web-btn");
+      if (globeBtn) globeBtn.style.color = isAutoScrapeOn ? "var(--spice-accent)" : "var(--spice-subtext)";
+
+      Spicetify.showNotification(`Auto-Scraper: ${isAutoScrapeOn ? "ON" : "OFF"}`);
+    }
+  ).register();
+})();
+
+// --- PERSISTENT CACHE ---
+function getCache() {
+  try {
+    return JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+  } catch { return {}; }
+}
+
+function setCache(id, date) {
+  const cache = getCache();
+  cache[id] = date;
+  // Limit cache size to prevent bloat (keep last 500)
+  const keys = Object.keys(cache);
+  if (keys.length > 500) delete cache[keys[0]];
+  localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+}
+
+// ==========================================================
+// 1. DISPLAY LOGIC (Debounced + Auto-Scrape Logic)
+// ==========================================================
+async function updateDisplay() {
+  // Clear any pending pre-fetches or updates to prevent "pile up"
+  clearTimeout(debounceTimer);
+  clearTimeout(prefetchTimer);
+
+  // 1. Instant Cleanup of old date
+  const old = document.getElementById('releaseDate');
+  if (old) old.remove();
+
+  // 2. Wait 2 seconds before doing anything (Debounce)
+  debounceTimer = setTimeout(async () => {
+    const track = Spicetify.Player.data.item;
+    if (!track) return;
+
+    const albumURI = track.album?.uri || track.metadata?.album_uri;
+    const albumID = albumURI ? albumURI.split(':')[2] : null;
+    if (!albumID) return;
+
+    // 3. CHECK CACHE (Fastest & Free)
+    const cache = getCache();
+    let date = cache[albumID];
+
+    // 4. Check Metadata (Memory)
+    if (!date) {
+      date = track.metadata?.release_date || track.album?.release_date || track.metadata?.year;
+    }
+
+    // 5. Render or Fetch
+    if (date) {
+      renderDate(date, "var(--spice-subtext)");
+      schedulePrefetch();
+    } else {
+      // If missing, try Internal API first
+      const foundInternal = await fetchInternal(albumURI, albumID, true);
+
+      // If Internal failed AND Auto-Scrape is ON -> Try Proxy
+      if (!foundInternal && isAutoScrapeOn) {
+        console.log("[NPRD] Internal failed. Triggering Auto-Scrape...");
+        // We don't await this because we don't want to block the UI
+        runWebScrape(true);
+      }
+
+      schedulePrefetch();
+    }
+  }, 2000); // 2-second buffer for rapid skipping
+}
+
+function schedulePrefetch() {
+  // Wait 15 seconds into the song before pre-fetching the NEXT one.
+  prefetchTimer = setTimeout(prefetchNextTrack, 15000);
+}
+
+function renderDate(rawDate, color) {
+  const container = document.querySelector(positionSelector);
+  if (!container) return;
+  if (document.getElementById('releaseDate')) return;
+
+  let display = rawDate;
+  const parts = rawDate.split('-');
+  if (parts.length === 3) display = `${parts[2]}-${parts[1]}-${parts[0]}`;
+
+  const span = document.createElement("span");
+  span.id = 'releaseDate';
+  span.style.color = color;
+  span.style.fontSize = "0.9em";
+  span.style.marginLeft = "8px";
+  span.style.opacity = "0.8";
+  span.innerText = `${separator} ${display}`;
+  container.appendChild(span);
+}
+
+// ==========================================================
+// 2. BACKGROUND WORKER (Lazy Pre-fetcher)
+// ==========================================================
+async function prefetchNextTrack() {
+  const nextTracks = Spicetify.Player.data.next_tracks;
+  if (!nextTracks || nextTracks.length === 0) return;
+
+  const nextFn = nextTracks[0];
+  const uri = nextFn.album?.uri || nextFn.metadata?.album_uri;
+  if (!uri) return;
+
+  const id = uri.split(':')[2];
+  const cache = getCache();
+  if (cache[id]) return; // Already cached
+
+  console.log(`[NPRD] Pre-fetching next (Lazy): ${nextFn.name}...`);
+  await fetchInternal(uri, id, false);
+}
+
+async function fetchInternal(uri, id, renderNow) {
+  if (!Spicetify.Platform?.PlayerAPI) return false;
+  try {
+    const data = await Spicetify.Platform.PlayerAPI.getAlbum(uri);
+    if (data) {
+      const date = data.releaseDate?.isoString || data.releaseDate || data.year;
+      if (date) {
+        setCache(id, date); // Save to persistent storage
+        if (renderNow) renderDate(date, "var(--spice-subtext)");
+        return true; // Success
+      }
+    }
+  } catch (e) { /* Silent fail */ }
+  return false; // Failed
+}
+
+// ==========================================================
+// 3. WEB SCRAPER & MANUAL BUTTONS
+// ==========================================================
+async function runApiFetch() {
+  const track = Spicetify.Player.data.item;
+  if (!track) return showModal("Error", "No song playing.", true);
+
+  const token = Spicetify.Platform?.Session?.accessToken || Spicetify.Platform?.AuthorizationAPI?.token?.accessToken;
+  const albumID = track.album.uri.split(':')[2];
+
+  showModal("⚡ API Request", "Contacting Spotify Servers...", false);
+
+  try {
+    const res = await fetch(`https://api.spotify.com/v1/albums/${albumID}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await res.json();
+
+    if (res.ok) {
+      setCache(albumID, data.release_date);
+      renderDate(data.release_date, "var(--spice-accent)");
+      showModal("✅ API Success", {
+        "Source": "Official API",
+        "Album": data.name,
+        "Date": data.release_date
+      }, false);
+    } else {
+      showModal("❌ API Failed", `Code: ${res.status}\nMessage: ${data.error?.message}`, true);
+    }
+  } catch (e) { showModal("❌ Network Error", e.message, true); }
+}
+
+async function runWebScrape(isAuto = false) {
+  const track = Spicetify.Player.data.item;
+  if (!track) {
+    if (!isAuto) showModal("Error", "No song playing.", true);
+    return;
+  }
+  const albumID = track.album.uri.split(':')[2];
+
+  // Visual feedback on the button
+  const btnWeb = document.getElementById("nprd-web-btn");
+  if (btnWeb) btnWeb.style.opacity = "0.5"; // Dim while loading
+
+  if (!isAuto) showModal("🌍 Web Scraper", "Contacting Public Proxy...\n(Bypassing API bans)", false);
+
+  try {
+    const publicUrl = `https://open.spotify.com/album/${albumID}`;
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(publicUrl)}`;
+
+    const res = await fetch(proxyUrl);
+    const html = await res.text();
+
+    let fullDate = null;
+    const patterns = [
+      /"datePublished"\s*:\s*"([0-9-]{10})"/,
+      /meta property="music:release_date" content="([0-9-]{10})"/,
+      /"releaseDate":"([0-9-]{10})"/
+    ];
+
+    for (let regex of patterns) {
+      const match = html.match(regex);
+      if (match && match[1]) {
+        fullDate = match[1];
+        break;
+      }
+    }
+
+    if (btnWeb) btnWeb.style.opacity = "1"; // Restore opacity
+
+    if (fullDate) {
+      setCache(albumID, fullDate);
+
+      // If Auto-Scrape found it, show in Accent Color (Green/Red/Blue) to indicate success
+      renderDate(fullDate, isAuto ? "var(--spice-accent)" : "var(--spice-accent)");
+
+      if (!isAuto) {
+        showModal("✅ Scraper Success", { "Source": "Public Web (Proxy)", "Date": fullDate }, false);
+      } else {
+        // Flash the button green briefly
+        if (btnWeb) {
+          const originalColor = btnWeb.style.color;
+          btnWeb.style.color = "var(--spice-notification)"; // Green flash
+          setTimeout(() => btnWeb.style.color = originalColor, 2000);
+        }
+      }
+    } else {
+      if (!isAuto) showModal("⚠️ Scraper Failed", "HTML received, but date pattern not found.", true);
+    }
+  } catch (e) {
+    if (btnWeb) btnWeb.style.opacity = "1";
+    if (!isAuto) showModal("❌ Scrape Network Error", "Proxy is unreachable.", true);
+  }
+}
+
+// ==========================================================
+// 4. UI COMPONENTS
+// ==========================================================
+function showModal(title, content, isError) {
+  const existing = document.getElementById('nprd-modal');
+  if (existing) existing.remove();
+
+  const wrapper = document.createElement('div');
+  wrapper.id = 'nprd-modal';
+  wrapper.style.cssText = `
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        width: 450px; background: var(--spice-main); border: 2px solid ${isError ? 'var(--spice-notification-error, #ff5555)' : 'var(--spice-accent)'};
+        box-shadow: 0 0 50px rgba(0,0,0,0.9); z-index: 10000;
+        border-radius: 4px; color: var(--spice-text); font-family: monospace;
+        padding: 20px; text-align: left;
+    `;
+
+  const h2 = document.createElement('h2');
+  h2.innerText = title;
+  h2.style.cssText = `margin-top:0; color: ${isError ? 'var(--spice-notification-error, #ff5555)' : 'var(--spice-accent)'}; border-bottom: 1px solid var(--spice-border-inactive); padding-bottom:10px; font-size: 18px;`;
+  wrapper.appendChild(h2);
+
+  const body = document.createElement('div');
+  body.style.marginTop = "15px";
+
+  if (typeof content === 'object' && content !== null) {
+    let html = '<table style="width:100%; border-collapse:collapse; font-size:13px;">';
+    for (const [key, val] of Object.entries(content)) {
+      html += `<tr><td style="color:var(--spice-subtext); padding:5px 0; width:100px;">${key}:</td><td style="padding:5px 0; color:var(--spice-text);">${val}</td></tr>`;
+    }
+    html += '</table>';
+    body.innerHTML = html;
+  } else {
+    body.innerText = content;
+  }
+  wrapper.appendChild(body);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.innerText = "[ CLOSE WINDOW ]";
+  closeBtn.style.cssText = "margin-top:20px; width:100%; padding:10px; background:var(--spice-card); color:var(--spice-subtext); border:1px solid var(--spice-border-inactive); cursor:pointer; font-family:monospace;";
+  closeBtn.onclick = () => wrapper.remove();
+  wrapper.appendChild(closeBtn);
+
+  document.body.appendChild(wrapper);
+}
+
+// ==========================================================
+// 5. INIT
+// ==========================================================
+(async function () {
+  while (!Spicetify || !Spicetify.Player) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  const style = document.createElement('style');
+  style.id = 'nprd-style';
+  style.innerHTML = `
+    .nprd-btn {
+        position: fixed;
+        top: 16px;
+        z-index: 2147483647;
+        width: 24px;
+        height: 24px;
+        border: none;
+        background-color: transparent;
+        color: var(--spice-subtext);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        font-size: 14px;
+        transition: color 0.2s ease, transform 0.2s ease;
+        opacity: 0.8;
+        -webkit-app-region: no-drag;
+    }
+    .nprd-btn:hover {
+        color: var(--spice-text);
+        transform: scale(1.1);
+        opacity: 1;
+    }
+  `;
+  document.head.appendChild(style);
+
+  const btnApi = document.createElement("button");
+  btnApi.id = "nprd-api-btn";
+  btnApi.className = "nprd-btn";
+  btnApi.innerText = "⚡";
+  btnApi.style.right = "130px";
+  btnApi.onclick = () => runApiFetch();
+  document.body.appendChild(btnApi);
+
+  const btnWeb = document.createElement("button");
+  btnWeb.id = "nprd-web-btn";
+  btnWeb.className = "nprd-btn";
+  btnWeb.innerText = "🌍";
+  btnWeb.style.right = "100px";
+  // Visual indicator if Auto-Scrape is ON at startup
+  if (isAutoScrapeOn) btnWeb.style.color = "var(--spice-accent)";
+  btnWeb.onclick = () => runWebScrape(false);
+  document.body.appendChild(btnWeb);
+
+  Spicetify.Player.addEventListener("songchange", updateDisplay);
+  updateDisplay();
+})();

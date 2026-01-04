@@ -1,0 +1,17 @@
+/* Force the Playback Bar to remain visible even in tiny tiles */
+.main-nowPlayingBar-container {
+    display: flex !important;
+    min-height: 90px !important;
+    visibility: visible !important;
+}
+
+/* Hide the song info/album art on the left when the window is narrow */
+/* This leaves more room for the play/pause buttons in the center */
+@media (max-width: 600px) {
+    .main-nowPlayingBar-left {
+        display: none !important;
+    }
+    .main-nowPlayingBar-right {
+        width: 100px !important;
+    }
+}
