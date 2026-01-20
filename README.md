@@ -10,8 +10,7 @@ Based on the **"text"** theme by [darkthemer](https://github.com/darkthemer).
 ## 📸 Showcase
 
 Here is a look at the theme in action, showing main views and specific details:
-**Podcasts**
-> Cleaner Podcasts section
+**Cleaner Podcasts section**
 ![He Aphexed even my little cousin](showcase/podcasts-easteregg)
 
 ## ✨ Features
